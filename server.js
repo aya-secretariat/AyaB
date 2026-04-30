@@ -1,4 +1,4 @@
-// server.js — AYA Backend pour Render (v2.7.1)
+// server.js — AYA Backend pour Render (v2.7.2)
 'use strict';
 
 const express  = require('express');
@@ -798,4 +798,4 @@ app.use((err, req, res, next) => {
 // Lancement
 // ─────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log('Serveur AYA v2.7.1 → Port ' + PORT));
+server.listen(PORT, () => console.log('Serveur AYA v2.7.2 → Port ' + PORT));

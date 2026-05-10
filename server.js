@@ -1446,7 +1446,7 @@ app.get('/api/admin/export/monthly', async (req, res) => {
                 COUNT(DISTINCT ai.client_device_id) as unique_clients
             FROM agent_interactions ai
             WHERE EXTRACT(MONTH FROM ai.start_time) = $1 
-            AND EXTRACT(YEAR            AND EXTRACT(YEAR FROM ai.start_time) = $2
+            AND EXTRACT(YEAR FROM ai.start_time) = $2
             AND ai.status = 'closed'
         `, [monthInt, yearInt]);
 
@@ -1543,7 +1543,7 @@ app.get('/api/admin/export/monthly', async (req, res) => {
             ['Gains totaux (FCFA)', parseFloat(g.total_earnings) || 0],
             ['Duree moyenne interaction (sec)', Math.round(parseFloat(g.avg_duration)) || 0],
             ['Temps total pause (h)', ((parseInt(p.total_pause_seconds) || 0) / 3600).toFixed(2)],
-            ['Note moyenne (/5)', parseFloat(e.avg_rating)?.toFixed(2) || 0],
+            ['Note moyenne (/5)', parseFloat(e.avg_rating || 0).toFixed(2)],
             ['Nombre evaluations', parseInt(e.total_evals) || 0],
             [],
             ['CALCULS COMPTABLES'],
@@ -1810,10 +1810,6 @@ app.get('/api/agent/stats/monthly/:agentId/:year/:month', async (req, res) => {
     }
 });
 
-// ═══════════════════════════════════════════════════════════
-// ROUTE UNIQUE : EXPORT EXCEL COMPTABILITE AGENT
-// (suppression du doublon qui causait un warning)
-// ═══════════════════════════════════════════════════════════
 app.get('/api/agent/stats/export/:agentId', async (req, res) => {
     try {
         const { agentId } = req.params;
@@ -2005,6 +2001,93 @@ app.get('/api/agent/stats/export/:agentId', async (req, res) => {
     }
 });
 
+
+        const totalEarnings = interactionsRes.rows.reduce((sum, r) => sum + (parseFloat(r.price_agreed) || 0), 0);
+        const totalDuration = interactionsRes.rows.reduce((sum, r) => sum + (parseInt(r.interaction_duration) || 0), 0);
+        interactionsData.push([]);
+        interactionsData.push(['TOTAL', '', '', '', '', '', totalDuration, totalEarnings, '']);
+        const wsInteractions = XLSX.utils.aoa_to_sheet(interactionsData);
+        XLSX.utils.book_append_sheet(wb, wsInteractions, 'Interactions');
+
+        const pausesHeaders = ['ID', 'Date debut', 'Date fin', 'Duree (sec)', 'Duree formatee'];
+        const pausesData = [pausesHeaders];
+        let totalPauseSeconds = 0;
+        pausesRes.rows.forEach(row => {
+            const d = row.duration_seconds || 0;
+            totalPauseSeconds += d;
+            const h = Math.floor(d / 3600);
+            const m = Math.floor((d % 3600) / 60);
+            const s = d % 60;
+            pausesData.push([
+                row.id,
+                row.start_time ? new Date(row.start_time).toLocaleString('fr-FR') : '-',
+                row.end_time ? new Date(row.end_time).toLocaleString('fr-FR') : '-',
+                d, (h > 0 ? h + 'h ' : '') + (m > 0 ? m + 'min ' : '') + s + 's'
+            ]);
+        });
+        pausesData.push([]);
+        const pH = Math.floor(totalPauseSeconds / 3600);
+        const pM = Math.floor((totalPauseSeconds % 3600) / 60);
+        const pS = totalPauseSeconds % 60;
+        pausesData.push(['TOTAL', '', '', totalPauseSeconds, (pH > 0 ? pH + 'h ' : '') + (pM > 0 ? pM + 'min ' : '') + pS + 's']);
+        const wsPauses = XLSX.utils.aoa_to_sheet(pausesData);
+        XLSX.utils.book_append_sheet(wb, wsPauses, 'Pauses');
+
+        const evalsHeaders = ['ID', 'Interaction ID', 'Note (/5)', 'Commentaire', 'Evalue par', 'Date'];
+        const evalsData = [evalsHeaders];
+        let totalRating = 0;
+        evalsRes.rows.forEach(row => {
+            totalRating += (row.rating || 0);
+            evalsData.push([
+                row.id, row.interaction_id || '-', row.rating || '-', row.comment || '-',
+                row.evaluated_by || 'system', row.created_at ? new Date(row.created_at).toLocaleString('fr-FR') : '-'
+            ]);
+        });
+        evalsData.push([]);
+        evalsData.push(['MOYENNE', '', '', evalsRes.rows.length > 0 ? (totalRating / evalsRes.rows.length).toFixed(2) : 0, '', '']);
+        const wsEvals = XLSX.utils.aoa_to_sheet(evalsData);
+        XLSX.utils.book_append_sheet(wb, wsEvals, 'Evaluations');
+
+        const dailyRes = await pool.query(`
+            SELECT 
+                DATE(start_time) as day,
+                COUNT(*) as interactions,
+                COALESCE(SUM(price_agreed), 0) as earnings,
+                COALESCE(AVG(interaction_duration), 0) as avg_duration
+            FROM agent_interactions
+            WHERE agent_id = $1 
+            AND EXTRACT(MONTH FROM start_time) = $2 
+            AND EXTRACT(YEAR FROM start_time) = $3
+            AND status = 'closed'
+            GROUP BY DATE(start_time)
+            ORDER BY day DESC
+        `, [agentId, monthInt, yearInt]);
+
+        const dailyHeaders = ['Date', 'Interactions', 'Gains (FCFA)', 'Duree moyenne (sec)', 'Productivite (clients/h)'];
+        const dailyData = [dailyHeaders];
+        dailyRes.rows.forEach(row => {
+            dailyData.push([
+                row.day ? new Date(row.day).toLocaleDateString('fr-FR') : '-',
+                row.interactions || 0, row.earnings || 0, Math.round(row.avg_duration) || 0,
+                row.avg_duration > 0 ? (3600 / row.avg_duration).toFixed(2) : 0
+            ]);
+        });
+        const wsDaily = XLSX.utils.aoa_to_sheet(dailyData);
+        XLSX.utils.book_append_sheet(wb, wsDaily, 'Journalier');
+
+        const excelBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' });
+        const fileName = 'AYA_Comptabilite_' + agentName.replace(/[^a-zA-Z0-9]/g, '_') + '_' + monthNames[monthInt] + '_' + yearInt + '.xlsx';
+
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', 'attachment; filename="' + fileName + '"');
+        res.setHeader('Content-Length', excelBuffer.length);
+        res.send(excelBuffer);
+    } catch(err) {
+        console.error('export excel:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ═══════════════════════════════════════════════════════════
 // ROUTE ID SEQUENTIEL GLOBAL — CORRECTION CRITIQUE
 // ═══════════════════════════════════════════════════════════
@@ -2033,8 +2116,7 @@ app.post('/api/device/sequential-id', async (req, res) => {
         `, [deviceId, newId]);
 
         // Forcer la mise a jour si display_id etait null
-        // CORRECTION : guillemets doubles pour eviter l'erreur d'apostrophe
-        await pool.query("UPDATE digital_ids SET display_id = $1 WHERE device_id = $2 AND (display_id IS NULL OR display_id = '')", [newId, deviceId]);
+        await pool.query('UPDATE digital_ids SET display_id = $1 WHERE device_id = $2 AND (display_id IS NULL OR display_id = '')', [newId, deviceId]);
 
         res.json({ displayId: newId });
     } catch(err) {

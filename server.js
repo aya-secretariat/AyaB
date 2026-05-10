@@ -1543,7 +1543,7 @@ app.get('/api/admin/export/monthly', async (req, res) => {
             ['Gains totaux (FCFA)', parseFloat(g.total_earnings) || 0],
             ['Duree moyenne interaction (sec)', Math.round(parseFloat(g.avg_duration)) || 0],
             ['Temps total pause (h)', ((parseInt(p.total_pause_seconds) || 0) / 3600).toFixed(2)],
-            ['Note moyenne (/5)', parseFloat(e.avg_rating)?.toFixed(2) || 0],
+            ['Note moyenne (/5)', parseFloat(e.avg_rating || 0).toFixed(2)],
             ['Nombre evaluations', parseInt(e.total_evals) || 0],
             [],
             ['CALCULS COMPTABLES'],
@@ -2001,111 +2001,7 @@ app.get('/api/agent/stats/export/:agentId', async (req, res) => {
     }
 });
 
-app.get('/api/agent/stats/export/:agentId', async (req, res) => {
-    try {
-        const { agentId } = req.params;
-        const { month, year } = req.query;
-        const monthInt = month ? parseInt(month) : new Date().getMonth() + 1;
-        const yearInt = year ? parseInt(year) : new Date().getFullYear();
 
-        const agentRow = await pool.query('SELECT * FROM agents WHERE id=$1', [agentId]);
-        const agentName = agentRow.rows[0]?.nom || 'Agent ' + agentId;
-
-        const monthlyRes = await pool.query(`
-            SELECT * FROM agent_monthly_stats 
-            WHERE agent_id = $1 AND month = $2 AND year = $3
-        `, [agentId, monthInt, yearInt]);
-
-        const interactionsRes = await pool.query(`
-            SELECT 
-                ai.id, ai.client_name, ai.service_name, ai.start_time, ai.end_time,
-                ai.first_response_time, ai.interaction_duration, ai.price_agreed, ai.status,
-                d.user_name as client_display_name
-            FROM agent_interactions ai
-            LEFT JOIN digital_ids d ON ai.client_device_id = d.device_id
-            WHERE ai.agent_id = $1 
-            AND EXTRACT(MONTH FROM ai.start_time) = $2 
-            AND EXTRACT(YEAR FROM ai.start_time) = $3
-            ORDER BY ai.start_time DESC
-        `, [agentId, monthInt, yearInt]);
-
-        const pausesRes = await pool.query(`
-            SELECT * FROM agent_pauses 
-            WHERE agent_id = $1 
-            AND EXTRACT(MONTH FROM start_time) = $2 
-            AND EXTRACT(YEAR FROM start_time) = $3
-            AND status = 'completed'
-            ORDER BY start_time DESC
-        `, [agentId, monthInt, yearInt]);
-
-        const evalsRes = await pool.query(`
-            SELECT * FROM agent_evaluations 
-            WHERE agent_id = $1 
-            AND EXTRACT(MONTH FROM created_at) = $2 
-            AND EXTRACT(YEAR FROM created_at) = $3
-            ORDER BY created_at DESC
-        `, [agentId, monthInt, yearInt]);
-
-        const monthNames = ['', 'Janvier', 'Fevrier', 'Mars', 'Avril', 'Mai', 'Juin',
-                           'Juillet', 'Aout', 'Septembre', 'Octobre', 'Novembre', 'Decembre'];
-
-        const wb = XLSX.utils.book_new();
-        wb.Props = {
-            Title: 'Rapport Comptabilite AYA - ' + agentName,
-            Subject: 'Statistiques mensuelles agent',
-            Author: 'AYA Secretariat Digital',
-            CreatedDate: new Date()
-        };
-
-        const stats = monthlyRes.rows[0] || {};
-        const resumeData = [
-            ['RAPPORT DE COMPTABILITE AYA'],
-            ['Agent:', agentName],
-            ['Periode:', monthNames[monthInt] + ' ' + yearInt],
-            ['Genere le:', new Date().toLocaleDateString('fr-FR')],
-            [],
-            ['INDICATEURS CLES'],
-            ['Total gains (FCFA)', stats.total_earnings || 0],
-            ['Clients servis', stats.total_clients_served || 0],
-            ['Interactions totales', stats.total_interactions || 0],
-            ['Temps de travail total (h)', ((stats.total_work_seconds || 0) / 3600).toFixed(2)],
-            ['Temps de pause total (h)', ((stats.total_pause_seconds || 0) / 3600).toFixed(2)],
-            ['Temps effectif (h)', (((stats.total_work_seconds || 0) - (stats.total_pause_seconds || 0)) / 3600).toFixed(2)],
-            [],
-            ['PERFORMANCES'],
-            ['Temps moyen de reponse (sec)', stats.avg_response_time_sec || 0],
-            ['Duree moyenne interaction (sec)', stats.avg_interaction_duration_sec || 0],
-            ['Note moyenne (/5)', stats.avg_rating || 0],
-            ['Taux de conversion (%)', stats.conversion_rate || 0],
-            [],
-            ['ACTIVITE'],
-            ['Messages envoyes', stats.total_messages_sent || 0],
-            ['Messages recus', stats.total_messages_received || 0],
-            ['Fichiers uploades', stats.total_files_uploaded || 0],
-            ['Prix envoyes', stats.total_prices_sent || 0],
-            ['Prix confirmes', stats.total_prices_confirmed || 0],
-            [],
-            ['CALCULS COMPTABLES'],
-            ['Gain moyen par client (FCFA)', stats.total_clients_served > 0 ? ((stats.total_earnings || 0) / stats.total_clients_served).toFixed(2) : 0],
-            ['Gain moyen par heure (FCFA)', ((stats.total_work_seconds || 0) - (stats.total_pause_seconds || 0)) > 0 ? 
-                ((stats.total_earnings || 0) / (((stats.total_work_seconds || 0) - (stats.total_pause_seconds || 0)) / 3600)).toFixed(2) : 0],
-            ['Productivite (clients/heure)', ((stats.total_work_seconds || 0) - (stats.total_pause_seconds || 0)) > 0 ? 
-                ((stats.total_clients_served || 0) / (((stats.total_work_seconds || 0) - (stats.total_pause_seconds || 0)) / 3600)).toFixed(2) : 0]
-        ];
-        const wsResume = XLSX.utils.aoa_to_sheet(resumeData);
-        XLSX.utils.book_append_sheet(wb, wsResume, 'Resume');
-
-        const interactionsHeaders = ['ID', 'Client', 'Service', 'Date debut', 'Date fin', 
-            'Temps 1ere reponse (sec)', 'Duree interaction (sec)', 'Prix convenu (FCFA)', 'Statut'];
-        const interactionsData = [interactionsHeaders];
-        interactionsRes.rows.forEach(row => {
-            interactionsData.push([
-                row.id, row.client_name || row.client_display_name || 'Inconnu', row.service_name,
-                row.start_time ? new Date(row.start_time).toLocaleString('fr-FR') : '-',
-                row.end_time ? new Date(row.end_time).toLocaleString('fr-FR') : '-',
-                row.first_response_time || 0, row.interaction_duration || 0, row.price_agreed || 0, row.status
-            ]);
-        });
         const totalEarnings = interactionsRes.rows.reduce((sum, r) => sum + (parseFloat(r.price_agreed) || 0), 0);
         const totalDuration = interactionsRes.rows.reduce((sum, r) => sum + (parseInt(r.interaction_duration) || 0), 0);
         interactionsData.push([]);

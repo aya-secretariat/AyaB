@@ -1446,7 +1446,7 @@ app.get('/api/admin/export/monthly', async (req, res) => {
                 COUNT(DISTINCT ai.client_device_id) as unique_clients
             FROM agent_interactions ai
             WHERE EXTRACT(MONTH FROM ai.start_time) = $1 
-            AND EXTRACT(YEAR FROM ai.start_time) = $2
+            AND EXTRACT(YEAR            AND EXTRACT(YEAR FROM ai.start_time) = $2
             AND ai.status = 'closed'
         `, [monthInt, yearInt]);
 
@@ -1810,197 +1810,10 @@ app.get('/api/agent/stats/monthly/:agentId/:year/:month', async (req, res) => {
     }
 });
 
-app.get('/api/agent/stats/export/:agentId', async (req, res) => {
-    try {
-        const { agentId } = req.params;
-        const { month, year } = req.query;
-        const monthInt = month ? parseInt(month) : new Date().getMonth() + 1;
-        const yearInt = year ? parseInt(year) : new Date().getFullYear();
-
-        const agentRow = await pool.query('SELECT * FROM agents WHERE id=$1', [agentId]);
-        const agentName = agentRow.rows[0]?.nom || 'Agent ' + agentId;
-
-        const monthlyRes = await pool.query(`
-            SELECT * FROM agent_monthly_stats 
-            WHERE agent_id = $1 AND month = $2 AND year = $3
-        `, [agentId, monthInt, yearInt]);
-
-        const interactionsRes = await pool.query(`
-            SELECT 
-                ai.id, ai.client_name, ai.service_name, ai.start_time, ai.end_time,
-                ai.first_response_time, ai.interaction_duration, ai.price_agreed, ai.status,
-                d.user_name as client_display_name
-            FROM agent_interactions ai
-            LEFT JOIN digital_ids d ON ai.client_device_id = d.device_id
-            WHERE ai.agent_id = $1 
-            AND EXTRACT(MONTH FROM ai.start_time) = $2 
-            AND EXTRACT(YEAR FROM ai.start_time) = $3
-            ORDER BY ai.start_time DESC
-        `, [agentId, monthInt, yearInt]);
-
-        const pausesRes = await pool.query(`
-            SELECT * FROM agent_pauses 
-            WHERE agent_id = $1 
-            AND EXTRACT(MONTH FROM start_time) = $2 
-            AND EXTRACT(YEAR FROM start_time) = $3
-            AND status = 'completed'
-            ORDER BY start_time DESC
-        `, [agentId, monthInt, yearInt]);
-
-        const evalsRes = await pool.query(`
-            SELECT * FROM agent_evaluations 
-            WHERE agent_id = $1 
-            AND EXTRACT(MONTH FROM created_at) = $2 
-            AND EXTRACT(YEAR FROM created_at) = $3
-            ORDER BY created_at DESC
-        `, [agentId, monthInt, yearInt]);
-
-        const monthNames = ['', 'Janvier', 'Fevrier', 'Mars', 'Avril', 'Mai', 'Juin',
-                           'Juillet', 'Aout', 'Septembre', 'Octobre', 'Novembre', 'Decembre'];
-
-        const wb = XLSX.utils.book_new();
-        wb.Props = {
-            Title: 'Rapport Comptabilite AYA - ' + agentName,
-            Subject: 'Statistiques mensuelles agent',
-            Author: 'AYA Secretariat Digital',
-            CreatedDate: new Date()
-        };
-
-        const stats = monthlyRes.rows[0] || {};
-        const resumeData = [
-            ['RAPPORT DE COMPTABILITE AYA'],
-            ['Agent:', agentName],
-            ['Periode:', monthNames[monthInt] + ' ' + yearInt],
-            ['Genere le:', new Date().toLocaleDateString('fr-FR')],
-            [],
-            ['INDICATEURS CLES'],
-            ['Total gains (FCFA)', stats.total_earnings || 0],
-            ['Clients servis', stats.total_clients_served || 0],
-            ['Interactions totales', stats.total_interactions || 0],
-            ['Temps de travail total (h)', ((stats.total_work_seconds || 0) / 3600).toFixed(2)],
-            ['Temps de pause total (h)', ((stats.total_pause_seconds || 0) / 3600).toFixed(2)],
-            ['Temps effectif (h)', (((stats.total_work_seconds || 0) - (stats.total_pause_seconds || 0)) / 3600).toFixed(2)],
-            [],
-            ['PERFORMANCES'],
-            ['Temps moyen de reponse (sec)', stats.avg_response_time_sec || 0],
-            ['Duree moyenne interaction (sec)', stats.avg_interaction_duration_sec || 0],
-            ['Note moyenne (/5)', stats.avg_rating || 0],
-            ['Taux de conversion (%)', stats.conversion_rate || 0],
-            [],
-            ['ACTIVITE'],
-            ['Messages envoyes', stats.total_messages_sent || 0],
-            ['Messages recus', stats.total_messages_received || 0],
-            ['Fichiers uploades', stats.total_files_uploaded || 0],
-            ['Prix envoyes', stats.total_prices_sent || 0],
-            ['Prix confirmes', stats.total_prices_confirmed || 0],
-            [],
-            ['CALCULS COMPTABLES'],
-            ['Gain moyen par client (FCFA)', stats.total_clients_served > 0 ? ((stats.total_earnings || 0) / stats.total_clients_served).toFixed(2) : 0],
-            ['Gain moyen par heure (FCFA)', ((stats.total_work_seconds || 0) - (stats.total_pause_seconds || 0)) > 0 ? 
-                ((stats.total_earnings || 0) / (((stats.total_work_seconds || 0) - (stats.total_pause_seconds || 0)) / 3600)).toFixed(2) : 0],
-            ['Productivite (clients/heure)', ((stats.total_work_seconds || 0) - (stats.total_pause_seconds || 0)) > 0 ? 
-                ((stats.total_clients_served || 0) / (((stats.total_work_seconds || 0) - (stats.total_pause_seconds || 0)) / 3600)).toFixed(2) : 0]
-        ];
-        const wsResume = XLSX.utils.aoa_to_sheet(resumeData);
-        XLSX.utils.book_append_sheet(wb, wsResume, 'Resume');
-
-        const interactionsHeaders = ['ID', 'Client', 'Service', 'Date debut', 'Date fin', 
-            'Temps 1ere reponse (sec)', 'Duree interaction (sec)', 'Prix convenu (FCFA)', 'Statut'];
-        const interactionsData = [interactionsHeaders];
-        interactionsRes.rows.forEach(row => {
-            interactionsData.push([
-                row.id, row.client_name || row.client_display_name || 'Inconnu', row.service_name,
-                row.start_time ? new Date(row.start_time).toLocaleString('fr-FR') : '-',
-                row.end_time ? new Date(row.end_time).toLocaleString('fr-FR') : '-',
-                row.first_response_time || 0, row.interaction_duration || 0, row.price_agreed || 0, row.status
-            ]);
-        });
-        const totalEarnings = interactionsRes.rows.reduce((sum, r) => sum + (parseFloat(r.price_agreed) || 0), 0);
-        const totalDuration = interactionsRes.rows.reduce((sum, r) => sum + (parseInt(r.interaction_duration) || 0), 0);
-        interactionsData.push([]);
-        interactionsData.push(['TOTAL', '', '', '', '', '', totalDuration, totalEarnings, '']);
-        const wsInteractions = XLSX.utils.aoa_to_sheet(interactionsData);
-        XLSX.utils.book_append_sheet(wb, wsInteractions, 'Interactions');
-
-        const pausesHeaders = ['ID', 'Date debut', 'Date fin', 'Duree (sec)', 'Duree formatee'];
-        const pausesData = [pausesHeaders];
-        let totalPauseSeconds = 0;
-        pausesRes.rows.forEach(row => {
-            const d = row.duration_seconds || 0;
-            totalPauseSeconds += d;
-            const h = Math.floor(d / 3600);
-            const m = Math.floor((d % 3600) / 60);
-            const s = d % 60;
-            pausesData.push([
-                row.id,
-                row.start_time ? new Date(row.start_time).toLocaleString('fr-FR') : '-',
-                row.end_time ? new Date(row.end_time).toLocaleString('fr-FR') : '-',
-                d, (h > 0 ? h + 'h ' : '') + (m > 0 ? m + 'min ' : '') + s + 's'
-            ]);
-        });
-        pausesData.push([]);
-        const pH = Math.floor(totalPauseSeconds / 3600);
-        const pM = Math.floor((totalPauseSeconds % 3600) / 60);
-        const pS = totalPauseSeconds % 60;
-        pausesData.push(['TOTAL', '', '', totalPauseSeconds, (pH > 0 ? pH + 'h ' : '') + (pM > 0 ? pM + 'min ' : '') + pS + 's']);
-        const wsPauses = XLSX.utils.aoa_to_sheet(pausesData);
-        XLSX.utils.book_append_sheet(wb, wsPauses, 'Pauses');
-
-        const evalsHeaders = ['ID', 'Interaction ID', 'Note (/5)', 'Commentaire', 'Evalue par', 'Date'];
-        const evalsData = [evalsHeaders];
-        let totalRating = 0;
-        evalsRes.rows.forEach(row => {
-            totalRating += (row.rating || 0);
-            evalsData.push([
-                row.id, row.interaction_id || '-', row.rating || '-', row.comment || '-',
-                row.evaluated_by || 'system', row.created_at ? new Date(row.created_at).toLocaleString('fr-FR') : '-'
-            ]);
-        });
-        evalsData.push([]);
-        evalsData.push(['MOYENNE', '', '', evalsRes.rows.length > 0 ? (totalRating / evalsRes.rows.length).toFixed(2) : 0, '', '']);
-        const wsEvals = XLSX.utils.aoa_to_sheet(evalsData);
-        XLSX.utils.book_append_sheet(wb, wsEvals, 'Evaluations');
-
-        const dailyRes = await pool.query(`
-            SELECT 
-                DATE(start_time) as day,
-                COUNT(*) as interactions,
-                COALESCE(SUM(price_agreed), 0) as earnings,
-                COALESCE(AVG(interaction_duration), 0) as avg_duration
-            FROM agent_interactions
-            WHERE agent_id = $1 
-            AND EXTRACT(MONTH FROM start_time) = $2 
-            AND EXTRACT(YEAR FROM start_time) = $3
-            AND status = 'closed'
-            GROUP BY DATE(start_time)
-            ORDER BY day DESC
-        `, [agentId, monthInt, yearInt]);
-
-        const dailyHeaders = ['Date', 'Interactions', 'Gains (FCFA)', 'Duree moyenne (sec)', 'Productivite (clients/h)'];
-        const dailyData = [dailyHeaders];
-        dailyRes.rows.forEach(row => {
-            dailyData.push([
-                row.day ? new Date(row.day).toLocaleDateString('fr-FR') : '-',
-                row.interactions || 0, row.earnings || 0, Math.round(row.avg_duration) || 0,
-                row.avg_duration > 0 ? (3600 / row.avg_duration).toFixed(2) : 0
-            ]);
-        });
-        const wsDaily = XLSX.utils.aoa_to_sheet(dailyData);
-        XLSX.utils.book_append_sheet(wb, wsDaily, 'Journalier');
-
-        const excelBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' });
-        const fileName = 'AYA_Comptabilite_' + agentName.replace(/[^a-zA-Z0-9]/g, '_') + '_' + monthNames[monthInt] + '_' + yearInt + '.xlsx';
-
-        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-        res.setHeader('Content-Disposition', 'attachment; filename="' + fileName + '"');
-        res.setHeader('Content-Length', excelBuffer.length);
-        res.send(excelBuffer);
-    } catch(err) {
-        console.error('export excel:', err.message);
-        res.status(500).json({ error: err.message });
-    }
-});
-
+// ═══════════════════════════════════════════════════════════
+// ROUTE UNIQUE : EXPORT EXCEL COMPTABILITE AGENT
+// (suppression du doublon qui causait un warning)
+// ═══════════════════════════════════════════════════════════
 app.get('/api/agent/stats/export/:agentId', async (req, res) => {
     try {
         const { agentId } = req.params;
@@ -2220,7 +2033,8 @@ app.post('/api/device/sequential-id', async (req, res) => {
         `, [deviceId, newId]);
 
         // Forcer la mise a jour si display_id etait null
-        await pool.query('UPDATE digital_ids SET display_id = $1 WHERE device_id = $2 AND (display_id IS NULL OR display_id = '')', [newId, deviceId]);
+        // CORRECTION : guillemets doubles pour eviter l'erreur d'apostrophe
+        await pool.query("UPDATE digital_ids SET display_id = $1 WHERE device_id = $2 AND (display_id IS NULL OR display_id = '')", [newId, deviceId]);
 
         res.json({ displayId: newId });
     } catch(err) {

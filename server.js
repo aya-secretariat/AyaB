@@ -249,16 +249,15 @@ async function emitAdminAgentsUpdate() {
                 currentPauseDuration = Math.floor((Date.now() - agentPauses.get(socketId).startTime) / 1000);
             }
 
-            var hasActiveClients = agent.activeClients && agent.activeClients.size > 0;
-            var firstClient = hasActiveClients ? agent.activeClients.entries().next().value : null;
+            const firstClient = agent.activeClients.size > 0 ? agent.activeClients.entries().next().value : null;
             agentsList.push({
                 agentId: agent.agentId,
                 agentName: agent.agentName,
-                status: isPaused ? 'paused' : (hasActiveClients ? 'busy' : 'online'),
+                status: isPaused ? 'paused' : (agent.activeClients.size > 0 ? 'busy' : 'online'),
                 currentClientDeviceId: firstClient ? firstClient[0] : null,
                 currentClientName: firstClient ? firstClient[1].clientName : null,
                 currentServiceName: firstClient ? firstClient[1].serviceName : null,
-                activeClientCount: hasActiveClients ? agent.activeClients.size : 0,
+                activeClientCount: agent.activeClients.size,
                 connectedAt: agent.connectedAt || new Date(),
                 todayClients,
                 todayEarnings,
@@ -375,13 +374,15 @@ io.on('connection', (socket) => {
             socket.emit('message_sent', { id: res.rows[0].id, text, time: timeStr });
             const userRow = await pool.query('SELECT user_name FROM digital_ids WHERE device_id=$1', [deviceId]);
             const userName = userRow.rows[0]?.user_name || 'Client';
-            io.to('agents').emit('client_message_to_agent', {
+            // Envoyer seulement à l'agent qui a pris ce client (room chat:deviceId)
+            io.to('chat:' + deviceId).emit('client_message_to_agent', {
                 id: res.rows[0].id, deviceId, text, time: timeStr, userName, displayId
             });
+            console.log('[Server] Message client', deviceId, '-> agent');
         } catch(err) {
             console.error('client_message:', err.message);
             const timeStr = now.toLocaleTimeString('fr-FR', {hour:'2-digit',minute:'2-digit'});
-            io.to('agents').emit('client_message_to_agent', { deviceId, text, time: timeStr, userName: 'Client', displayId });
+            io.to('chat:' + deviceId).emit('client_message_to_agent', { deviceId, text, time: timeStr, userName: 'Client', displayId });
         }
     });
 
@@ -440,9 +441,32 @@ io.on('connection', (socket) => {
             const sessionRes = await pool.query(`INSERT INTO agent_sessions (agent_id, login_time) VALUES ($1, NOW()) RETURNING id`, [agentId]);
             const sessionId = sessionRes.rows[0].id;
             socket.join('agents');
+
+            // RESTAURER activeClients depuis la DB (interactions actives)
+            const activeClients = new Map();
+            try {
+                const activeRows = await pool.query(
+                    `SELECT ai.id as interaction_id, ai.client_device_id, ai.client_name, ai.service_name, sr.service_name as sr_service
+                     FROM agent_interactions ai
+                     LEFT JOIN service_requests sr ON ai.client_device_id = sr.device_id
+                     WHERE ai.agent_id=$1 AND ai.status='active'`,
+                    [agentId]
+                );
+                for (const row of activeRows.rows) {
+                    activeClients.set(row.client_device_id, {
+                        clientName: row.client_name || 'Client',
+                        serviceName: row.service_name || row.sr_service || 'Service',
+                        interactionId: row.interaction_id,
+                        startTime: new Date()
+                    });
+                    socket.join('chat:' + row.client_device_id);
+                    console.log('[Server] Client restauré pour agent', agentName, ':', row.client_device_id);
+                }
+            } catch(e) { console.error('[Server] Erreur restauration activeClients:', e.message); }
+
             connectedAgents.set(socket.id, {
                 agentId, agentName, sessionId,
-                activeClients: new Map(),
+                activeClients: activeClients,
                 connectedAt: new Date()
             });
             socket.emit('agent_registered', { agentId, sessionId, agentName });
@@ -455,18 +479,13 @@ io.on('connection', (socket) => {
                     totalEarnings: statsRow.rows[0].total_earnings
                 });
             }
-            console.log('Agent connecte :', agentName, '(ID:', agentId, ')');
+            console.log('Agent connecte :', agentName, '(ID:', agentId, ') avec', activeClients.size, 'clients actifs');
             emitAdminAgentsUpdate();
         } catch(err) {
             console.error('agent_connect:', err.message);
             const mockAgentId = Math.floor(Math.random() * 10000);
             const mockSessionId = Math.floor(Math.random() * 10000);
             socket.join('agents');
-            connectedAgents.set(socket.id, {
-                agentId: mockAgentId, agentName, sessionId: mockSessionId,
-                currentClientDeviceId: null, currentClientName: null,
-                currentServiceName: null, connectedAt: new Date()
-            });
             connectedAgents.set(socket.id, {
                 agentId: mockAgentId, agentName, sessionId: mockSessionId,
                 activeClients: new Map(),
@@ -518,23 +537,19 @@ io.on('connection', (socket) => {
             socket.join('chat:' + deviceId);
         } catch(err) {
             console.error('agent_prend_client:', err.message);
-            var interactionId = Math.floor(Math.random() * 10000);
-            agent.activeClients.set(deviceId, {
-                clientName: clientInfo.userName,
-                serviceName: clientInfo.serviceName,
-                interactionId: interactionId,
-                startTime: new Date()
-            });
+            agent.currentClientDeviceId = deviceId;
+            agent.currentClientName = clientInfo.userName;
+            agent.currentServiceName = clientInfo.serviceName;
+            agent.currentInteractionId = Math.floor(Math.random() * 10000);
             connectedAgents.set(socket.id, agent);
             socket.join('chat:' + deviceId);
         }
         emitAdminAgentsUpdate();
-        io.to('agents').emit('liste_attente', Array.from(fileAttente.values()));
     });
 
     socket.on('agent_message', async ({ deviceId, text }) => {
         const agent = connectedAgents.get(socket.id);
-        if (!agent || !agent.activeClients || !agent.activeClients.has(deviceId)) return;
+        if (!agent || !agent.activeClients.has(deviceId)) return;
         const now = new Date();
         const timeStr = now.toLocaleTimeString('fr-FR', {hour:'2-digit',minute:'2-digit'});
         try {
@@ -546,7 +561,7 @@ io.on('connection', (socket) => {
 
     socket.on('agent_upload_media', async ({ deviceId, url, fileName, mediaType, text }) => {
         const agent = connectedAgents.get(socket.id);
-        if (!agent || !agent.activeClients || !agent.activeClients.has(deviceId)) return;
+        if (!agent || !agent.activeClients.has(deviceId)) return;
         const now = new Date();
         const timeStr = now.toLocaleTimeString('fr-FR', {hour:'2-digit',minute:'2-digit'});
         try {
@@ -574,16 +589,12 @@ io.on('connection', (socket) => {
 
     socket.on('agent_send_price', async ({ deviceId, price }) => {
         const agent = connectedAgents.get(socket.id);
-        if (!agent || !agent.activeClients) return;
+        if (!agent) return;
         const clientData = agent.activeClients.get(deviceId);
-        if (!clientData) {
-            console.error('[Server] agent_send_price: client non trouvé dans activeClients', deviceId);
-            return;
-        }
+        if (!clientData) return;
         try {
             const pcRes = await pool.query(`INSERT INTO price_confirmations (interaction_id, agent_id, client_device_id, price) VALUES ($1,$2,$3,$4) RETURNING id`, [clientData.interactionId, agent.agentId, deviceId, price]);
             io.to('user:' + deviceId).emit('price_link', { price, confirmationId: pcRes.rows[0].id });
-            console.log('[Server] Prix envoyé au client', deviceId, ':', price, 'FCFA');
         } catch(err) {
             console.error('agent_send_price:', err.message);
             io.to('user:' + deviceId).emit('price_link', { price, confirmationId: Math.floor(Math.random() * 100000) });
@@ -592,7 +603,7 @@ io.on('connection', (socket) => {
 
     socket.on('agent_close_chat', async ({ deviceId, firstResponseTime, interactionDuration }) => {
         const agent = connectedAgents.get(socket.id);
-        if (!agent || !agent.activeClients) return;
+        if (!agent) return;
         const clientData = agent.activeClients.get(deviceId);
         if (!clientData) return;
         try {
@@ -675,13 +686,11 @@ io.on('connection', (socket) => {
                 agentPauses.delete(socket.id);
             }
             // Fermer toutes les interactions actives
-            if (agent.activeClients) {
-                for (const [deviceId, clientData] of agent.activeClients.entries()) {
-                    try {
-                        await pool.query(`UPDATE agent_interactions SET end_time=NOW(), status='closed' WHERE id=$1`, [clientData.interactionId]);
-                        await pool.query(`UPDATE service_requests SET status='closed', closed_at=NOW() WHERE device_id=$1 AND status='active'`, [deviceId]);
-                    } catch(e) {}
-                }
+            for (const [deviceId, clientData] of agent.activeClients.entries()) {
+                try {
+                    await pool.query(`UPDATE agent_interactions SET end_time=NOW(), status='closed' WHERE id=$1`, [clientData.interactionId]);
+                    await pool.query(`UPDATE service_requests SET status='closed', closed_at=NOW() WHERE device_id=$1 AND status='active'`, [deviceId]);
+                } catch(e) {}
             }
             try {
                 await pool.query(`UPDATE agent_sessions SET logout_time=NOW(), total_duration=EXTRACT(EPOCH FROM (NOW() - login_time))::INTEGER WHERE id=$1`, [agent.sessionId]);
@@ -776,11 +785,9 @@ io.on('connection', (socket) => {
                 pool.query(`UPDATE agent_pauses SET end_time=NOW(), duration_seconds=$1, status='completed' WHERE id=$2`, [durationSeconds, pauseInfo.pauseId]).catch(() => {});
                 agentPauses.delete(socket.id);
             }
-            if (agent.activeClients) {
-                for (const [deviceId, clientData] of agent.activeClients.entries()) {
-                    pool.query(`UPDATE agent_interactions SET end_time=NOW(), status='closed' WHERE id=$1`, [clientData.interactionId]).catch(() => {});
-                    pool.query(`UPDATE service_requests SET status='closed', closed_at=NOW() WHERE device_id=$1 AND status='active'`, [deviceId]).catch(() => {});
-                }
+            for (const [deviceId, clientData] of agent.activeClients.entries()) {
+                pool.query(`UPDATE agent_interactions SET end_time=NOW(), status='closed' WHERE id=$1`, [clientData.interactionId]).catch(() => {});
+                pool.query(`UPDATE service_requests SET status='closed', closed_at=NOW() WHERE device_id=$1 AND status='active'`, [deviceId]).catch(() => {});
             }
             pool.query(`UPDATE agent_sessions SET logout_time=NOW(), total_duration=EXTRACT(EPOCH FROM (NOW()-login_time))::INTEGER WHERE id=$1 AND logout_time IS NULL`, [agent.sessionId]).catch(() => {});
             connectedAgents.delete(socket.id);
@@ -814,8 +821,7 @@ app.post('/api/upload', upload.single('fichier'), async (req, res) => {
     const { deviceId, targetDeviceId, uploadedBy } = req.body;
     const file = req.file;
     if (!file) return res.status(400).json({ erreur: 'Aucun fichier recu' });
-    const baseUrl = req.protocol + '://' + (req.get('host') || '');
-    const url = baseUrl + '/uploads/' + file.filename;
+    const url = '/uploads/' + file.filename;
     const effectiveDeviceId = targetDeviceId || deviceId || 'anonymous';
     const effectiveUploader = uploadedBy || 'client';
     try {

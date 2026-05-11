@@ -249,13 +249,15 @@ async function emitAdminAgentsUpdate() {
                 currentPauseDuration = Math.floor((Date.now() - agentPauses.get(socketId).startTime) / 1000);
             }
 
+            const firstClient = agent.activeClients.size > 0 ? agent.activeClients.entries().next().value : null;
             agentsList.push({
                 agentId: agent.agentId,
                 agentName: agent.agentName,
-                status: isPaused ? 'paused' : (agent.currentClientDeviceId ? 'busy' : 'online'),
-                currentClientDeviceId: agent.currentClientDeviceId || null,
-                currentClientName: agent.currentClientName || null,
-                currentServiceName: agent.currentServiceName || null,
+                status: isPaused ? 'paused' : (agent.activeClients.size > 0 ? 'busy' : 'online'),
+                currentClientDeviceId: firstClient ? firstClient[0] : null,
+                currentClientName: firstClient ? firstClient[1].clientName : null,
+                currentServiceName: firstClient ? firstClient[1].serviceName : null,
+                activeClientCount: agent.activeClients.size,
                 connectedAt: agent.connectedAt || new Date(),
                 todayClients,
                 todayEarnings,
@@ -439,8 +441,8 @@ io.on('connection', (socket) => {
             socket.join('agents');
             connectedAgents.set(socket.id, {
                 agentId, agentName, sessionId,
-                currentClientDeviceId: null, currentClientName: null,
-                currentServiceName: null, connectedAt: new Date()
+                activeClients: new Map(),
+                connectedAt: new Date()
             });
             socket.emit('agent_registered', { agentId, sessionId, agentName });
             socket.emit('liste_attente', Array.from(fileAttente.values()));
@@ -522,23 +524,19 @@ io.on('connection', (socket) => {
 
     socket.on('agent_message', async ({ deviceId, text }) => {
         const agent = connectedAgents.get(socket.id);
-        if (!agent) return;
+        if (!agent || !agent.activeClients.has(deviceId)) return;
         const now = new Date();
+        const timeStr = now.toLocaleTimeString('fr-FR', {hour:'2-digit',minute:'2-digit'});
         try {
             await pool.query(`INSERT INTO chat_messages (device_id, message_text, sender_type) VALUES ($1,$2,'agent')`, [deviceId, text]);
-            const timeStr = now.toLocaleTimeString('fr-FR', {hour:'2-digit',minute:'2-digit'});
-            io.to('user:' + deviceId).emit('agent_reply', { text, time: timeStr });
-            socket.emit('agent_message_sent', { deviceId, text, time: timeStr });
-        } catch(err) {
-            console.error('agent_message:', err.message);
-            const timeStr = now.toLocaleTimeString('fr-FR', {hour:'2-digit',minute:'2-digit'});
-            io.to('user:' + deviceId).emit('agent_reply', { text, time: timeStr });
-        }
+        } catch(err) { console.error('agent_message:', err.message); }
+        io.to('user:' + deviceId).emit('agent_reply', { text, time: timeStr });
+        socket.emit('agent_message_sent', { deviceId, text, time: timeStr });
     });
 
     socket.on('agent_upload_media', async ({ deviceId, url, fileName, mediaType, text }) => {
         const agent = connectedAgents.get(socket.id);
-        if (!agent) return;
+        if (!agent || !agent.activeClients.has(deviceId)) return;
         const now = new Date();
         const timeStr = now.toLocaleTimeString('fr-FR', {hour:'2-digit',minute:'2-digit'});
         try {
@@ -567,10 +565,10 @@ io.on('connection', (socket) => {
     socket.on('agent_send_price', async ({ deviceId, price }) => {
         const agent = connectedAgents.get(socket.id);
         if (!agent) return;
+        const clientData = agent.activeClients.get(deviceId);
+        if (!clientData) return;
         try {
-            const interactionId = agent.currentInteractionId;
-            if (!interactionId) return;
-            const pcRes = await pool.query(`INSERT INTO price_confirmations (interaction_id, agent_id, client_device_id, price) VALUES ($1,$2,$3,$4) RETURNING id`, [interactionId, agent.agentId, deviceId, price]);
+            const pcRes = await pool.query(`INSERT INTO price_confirmations (interaction_id, agent_id, client_device_id, price) VALUES ($1,$2,$3,$4) RETURNING id`, [clientData.interactionId, agent.agentId, deviceId, price]);
             io.to('user:' + deviceId).emit('price_link', { price, confirmationId: pcRes.rows[0].id });
         } catch(err) {
             console.error('agent_send_price:', err.message);
@@ -581,40 +579,30 @@ io.on('connection', (socket) => {
     socket.on('agent_close_chat', async ({ deviceId, firstResponseTime, interactionDuration }) => {
         const agent = connectedAgents.get(socket.id);
         if (!agent) return;
+        const clientData = agent.activeClients.get(deviceId);
+        if (!clientData) return;
         try {
-            const interactionId = agent.currentInteractionId;
-            if (interactionId) {
-                await pool.query(`UPDATE agent_interactions SET end_time=NOW(), first_response_time=$1, interaction_duration=$2, status='closed' WHERE id=$3`, [firstResponseTime || 0, interactionDuration || 0, interactionId]);
-                const today = new Date().toISOString().split('T')[0];
-                const interactionRow = await pool.query('SELECT price_agreed FROM agent_interactions WHERE id=$1', [interactionId]);
-                const priceAgreed = interactionRow.rows[0]?.price_agreed || 0;
-                await pool.query(`INSERT INTO agent_daily_stats (agent_id, date, total_time_seconds, total_earnings, clients_served) VALUES ($1,$2,$3,$4,1) ON CONFLICT (agent_id, date) DO UPDATE SET total_time_seconds=agent_daily_stats.total_time_seconds+$3, total_earnings=agent_daily_stats.total_earnings+$4, clients_served=agent_daily_stats.clients_served+1`, [agent.agentId, today, interactionDuration || 0, priceAgreed]);
-                await pool.query(`UPDATE service_requests SET status='closed', closed_at=NOW() WHERE device_id=$1 AND status='active'`, [deviceId]);
-            }
-            agent.currentClientDeviceId = null;
-            agent.currentClientName = null;
-            agent.currentServiceName = null;
-            agent.currentInteractionId = null;
-            connectedAgents.set(socket.id, agent);
+            await pool.query(`UPDATE agent_interactions SET end_time=NOW(), first_response_time=$1, interaction_duration=$2, status='closed' WHERE id=$3`, [firstResponseTime || 0, interactionDuration || 0, clientData.interactionId]);
             const today = new Date().toISOString().split('T')[0];
-            const statsRow = await pool.query(`SELECT * FROM agent_daily_stats WHERE agent_id=$1 AND date=$2`, [agent.agentId, today]);
-            if (statsRow.rows.length) {
-                io.to(socket.id).emit('agent_stats_update', {
-                    clientsServed: statsRow.rows[0].clients_served,
-                    totalEarnings: statsRow.rows[0].total_earnings
-                });
-            }
-            emitAdminAgentsUpdate();
-            io.to('agents').emit('liste_attente', Array.from(fileAttente.values()));
+            const interactionRow = await pool.query('SELECT price_agreed FROM agent_interactions WHERE id=$1', [clientData.interactionId]);
+            const priceAgreed = interactionRow.rows[0]?.price_agreed || 0;
+            await pool.query(`INSERT INTO agent_daily_stats (agent_id, date, total_time_seconds, total_earnings, clients_served) VALUES ($1,$2,$3,$4,1) ON CONFLICT (agent_id, date) DO UPDATE SET total_time_seconds=agent_daily_stats.total_time_seconds+$3, total_earnings=agent_daily_stats.total_earnings+$4, clients_served=agent_daily_stats.clients_served+1`, [agent.agentId, today, interactionDuration || 0, priceAgreed]);
+            await pool.query(`UPDATE service_requests SET status='closed', closed_at=NOW() WHERE device_id=$1 AND status='active'`, [deviceId]);
         } catch(err) {
-            console.error('agent_close_chat:', err.message);
-            agent.currentClientDeviceId = null;
-            agent.currentClientName = null;
-            agent.currentServiceName = null;
-            agent.currentInteractionId = null;
-            connectedAgents.set(socket.id, agent);
-            emitAdminAgentsUpdate();
+            console.error('agent_close_chat DB:', err.message);
         }
+        agent.activeClients.delete(deviceId);
+        connectedAgents.set(socket.id, agent);
+        const today = new Date().toISOString().split('T')[0];
+        const statsRow = await pool.query(`SELECT * FROM agent_daily_stats WHERE agent_id=$1 AND date=$2`, [agent.agentId, today]);
+        if (statsRow.rows.length) {
+            io.to(socket.id).emit('agent_stats_update', {
+                clientsServed: statsRow.rows[0].clients_served,
+                totalEarnings: statsRow.rows[0].total_earnings
+            });
+        }
+        emitAdminAgentsUpdate();
+        io.to('agents').emit('liste_attente', Array.from(fileAttente.values()));
     });
 
     // PAUSE AGENT
@@ -671,6 +659,13 @@ io.on('connection', (socket) => {
                     await pool.query(`UPDATE agent_pauses SET end_time=NOW(), duration_seconds=$1, status='completed' WHERE id=$2`, [durationSeconds, pauseInfo.pauseId]);
                 } catch(e) {}
                 agentPauses.delete(socket.id);
+            }
+            // Fermer toutes les interactions actives
+            for (const [deviceId, clientData] of agent.activeClients.entries()) {
+                try {
+                    await pool.query(`UPDATE agent_interactions SET end_time=NOW(), status='closed' WHERE id=$1`, [clientData.interactionId]);
+                    await pool.query(`UPDATE service_requests SET status='closed', closed_at=NOW() WHERE device_id=$1 AND status='active'`, [deviceId]);
+                } catch(e) {}
             }
             try {
                 await pool.query(`UPDATE agent_sessions SET logout_time=NOW(), total_duration=EXTRACT(EPOCH FROM (NOW() - login_time))::INTEGER WHERE id=$1`, [agent.sessionId]);
@@ -764,6 +759,10 @@ io.on('connection', (socket) => {
                 const durationSeconds = Math.floor((Date.now() - pauseInfo.startTime) / 1000);
                 pool.query(`UPDATE agent_pauses SET end_time=NOW(), duration_seconds=$1, status='completed' WHERE id=$2`, [durationSeconds, pauseInfo.pauseId]).catch(() => {});
                 agentPauses.delete(socket.id);
+            }
+            for (const [deviceId, clientData] of agent.activeClients.entries()) {
+                pool.query(`UPDATE agent_interactions SET end_time=NOW(), status='closed' WHERE id=$1`, [clientData.interactionId]).catch(() => {});
+                pool.query(`UPDATE service_requests SET status='closed', closed_at=NOW() WHERE device_id=$1 AND status='active'`, [deviceId]).catch(() => {});
             }
             pool.query(`UPDATE agent_sessions SET logout_time=NOW(), total_duration=EXTRACT(EPOCH FROM (NOW()-login_time))::INTEGER WHERE id=$1 AND logout_time IS NULL`, [agent.sessionId]).catch(() => {});
             connectedAgents.delete(socket.id);

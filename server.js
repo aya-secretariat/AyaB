@@ -183,7 +183,36 @@ async function initDB() {
         console.error('initDB:', err.message);
     }
 }
-initDB();
+initDB().then(() => {
+    setTimeout(restoreWaitingQueue, 2000);
+}).catch(err => console.error('initDB:', err));
+
+
+// Restauration de la file d'attente au demarrage (Render free tier redemarre souvent)
+async function restoreWaitingQueue() {
+    try {
+        const result = await pool.query(
+            `SELECT sr.device_id, sr.service_name, sr.requested_at, d.user_name, d.display_id, d.lang
+             FROM service_requests sr
+             LEFT JOIN digital_ids d ON sr.device_id = d.device_id
+             WHERE sr.status = 'waiting'
+             ORDER BY sr.requested_at ASC`
+        );
+        for (const row of result.rows) {
+            fileAttente.set(row.device_id, {
+                deviceId: row.device_id,
+                userName: row.user_name || 'Client',
+                displayId: row.display_id || row.device_id,
+                serviceName: row.service_name,
+                lang: row.lang || 'fr',
+                connectedAt: row.requested_at
+            });
+        }
+        console.log('[Server] File d\'attente restauree:', fileAttente.size, 'clients');
+    } catch(err) {
+        console.error('[Server] restoreWaitingQueue:', err.message);
+    }
+}
 
 // Etat en memoire
 const connectedUsers = new Map();
@@ -379,6 +408,7 @@ io.on('connection', (socket) => {
             if (typeof callback === 'function') callback({ ok: true });
         }
         emitAdminAgentsUpdate();
+            io.to('agents').emit('liste_attente', Array.from(fileAttente.values()));
     });
 
     socket.on('confirm_price', async ({ confirmationId, deviceId }) => {
@@ -575,6 +605,7 @@ io.on('connection', (socket) => {
                 });
             }
             emitAdminAgentsUpdate();
+            io.to('agents').emit('liste_attente', Array.from(fileAttente.values()));
         } catch(err) {
             console.error('agent_close_chat:', err.message);
             agent.currentClientDeviceId = null;
@@ -647,6 +678,7 @@ io.on('connection', (socket) => {
             connectedAgents.delete(socket.id);
             console.log('Agent deconnecte :', agent.agentName);
             emitAdminAgentsUpdate();
+            io.to('agents').emit('liste_attente', Array.from(fileAttente.values()));
         }
     });
 
@@ -737,6 +769,7 @@ io.on('connection', (socket) => {
             connectedAgents.delete(socket.id);
             console.log('Agent deconnecte:', agent.agentName);
             emitAdminAgentsUpdate();
+            io.to('agents').emit('liste_attente', Array.from(fileAttente.values()));
         }
         if (user) connectedUsers.delete(socket.id);
         console.log('Deconnecte :', socket.id);
